@@ -1,0 +1,26 @@
+# Dependabot configuration — TypeScript / Node.js
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates
+
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "dependencies"
+      - "automated"
+    # Group patch + minor updates to reduce PR noise
+    groups:
+      patch-and-minor:
+        update-types: ["minor", "patch"]
+      major:
+        update-types: ["major"]
+    # Ignore major bumps for runtime libs we control
+    ignore:
+      - dependency-name: "@quilt/*"
+        update-types: ["version-update:semver-major"]
