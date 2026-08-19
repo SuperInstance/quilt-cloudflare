@@ -1,0 +1,38 @@
+name = "quilt-cloudflare"
+main = "src/worker.ts"
+compatibility_date = "2024-01-01"
+
+# D1 database for persistent cell storage
+# Create with: wrangler d1 create quilt-db
+[[d1_databases]]
+binding = "DB"
+database_name = "quilt-db"
+database_id = "your-database-id-here"
+
+# Vectorize for semantic cell search
+# Create with: wrangler vectorize create quilt-embeddings --dimensions=768
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "quilt-embeddings"
+
+# KV for fast ephemeral state
+# Create with: wrangler kv:namespace create CACHE
+[[kv_namespaces]]
+binding = "CACHE"
+id = "your-namespace-id-here"
+
+# Workers AI for LLM cells
+[ai]
+binding = "AI"
+
+# Cron triggers for sensor cells
+# [triggers]
+# crons = ["*/1 * * * *"]  # every minute
+
+[build]
+command = "echo Building..."
+
+[build.upload]
+format = "modules"
+dir = "src"
+main = "./worker.ts"

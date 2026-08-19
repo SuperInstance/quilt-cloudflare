@@ -1,0 +1,37 @@
+{
+  "name": "quilt-cloudflare",
+  "version": "0.1.0",
+  "description": "A Quilt reactive runtime on Cloudflare Workers, D1, Vectorize, KV, R2.",
+  "main": "src/worker.ts",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "wrangler deploy --dry-run --outdir=dist",
+    "deploy": "wrangler deploy",
+    "deploy:ui": "wrangler pages deploy ui",
+    "db:init": "wrangler d1 execute quilt-db --file=./schema.sql",
+    "db:reset": "wrangler d1 execute quilt-db --command='DROP TABLE IF EXISTS cells; DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS history; DROP TABLE IF EXISTS listeners;'",
+    "vectorize:create": "wrangler vectorize create quilt-embeddings --dimensions=768",
+    "kv:create": "wrangler kv:namespace create CACHE",
+    "tail": "wrangler tail",
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": [
+    "quilt",
+    "cloudflare",
+    "workers",
+    "d1",
+    "vectorize",
+    "ai",
+    "reactive",
+    "cells",
+    "runtime"
+  ],
+  "author": "SuperInstance",
+  "license": "MIT",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240000.0",
+    "typescript": "^5.3.0",
+    "wrangler": "^3.0.0"
+  }
+}

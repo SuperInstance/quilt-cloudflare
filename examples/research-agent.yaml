@@ -1,0 +1,39 @@
+id: research-agent
+title: "AI research agent on Cloudflare"
+version: 0.1.0
+description: "An agent that researches a topic using Workers AI."
+
+cells:
+  - id: input.task
+    kind: value
+    value: "What is Quilt?"
+
+  - id: memory.history
+    kind: value
+    value: []
+    description: "Past queries"
+
+  - id: prompt.explain
+    kind: ai.llm
+    model: "@cf/meta/llama-3-8b-instruct"
+    prompt: '"You are a research agent. The user asked: " + input.task + ". Explain what you would research."'
+    max_tokens: 200
+    description: "Initial reasoning"
+
+  - id: output.summary
+    kind: ai.summarize
+    input: "prompt.explain"
+    max_tokens: 80
+    description: "Summary of the reasoning"
+
+  - id: embedding
+    kind: ai.embed
+    model: "@cf/baai/bge-base-en-v1.5"
+    input: "output.summary"
+    description: "Vector embedding (for semantic search across agents)"
+
+  - id: status
+    kind: listener
+    watch: output.summary
+    condition: 'output.summary.length > 0'
+    action: 'console.log("✓ Research complete")'

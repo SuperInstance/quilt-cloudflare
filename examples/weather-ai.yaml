@@ -1,0 +1,64 @@
+id: weather
+title: "AI-powered weather station"
+version: 0.1.0
+description: "Reads temperature and humidity, AI explains what to wear."
+
+cells:
+  # Sensors
+  - id: sensor.temp
+    kind: sensor
+    source: dht22
+    default: 22
+    description: "Current temperature in Celsius"
+
+  - id: sensor.humid
+    kind: sensor
+    source: dht22
+    default: 50
+    description: "Current humidity in %"
+
+  # Computed
+  - id: heat_index
+    kind: formula
+    expr: "sensor.temp + (sensor.humid - 50) * 0.05"
+    description: "Apparent temperature"
+
+  - id: fahrenheit
+    kind: formula
+    expr: "sensor.temp * 1.8 + 32"
+    description: "Temperature in Fahrenheit"
+
+  # AI explanations
+  - id: advice
+    kind: ai.llm
+    model: "@cf/meta/llama-3-8b-instruct"
+    prompt: '"The temperature is " + sensor.temp + "°C with " + sensor.humid + "% humidity. Give me 1 short sentence of clothing advice."'
+    description: "AI-generated clothing advice"
+
+  - id: summary
+    kind: ai.summarize
+    input: "advice"
+    max_tokens: 50
+    description: "Concise summary of the advice"
+
+  # Embedding for semantic search
+  - id: embedding
+    kind: ai.embed
+    model: "@cf/baai/bge-base-en-v1.5"
+    input: "advice"
+    description: "Vector embedding of the advice (for semantic search)"
+
+  # Listeners
+  - id: alert
+    kind: listener
+    watch: heat_index
+    condition: "heat_index > 30"
+    action: 'console.log("⚠️ It is hot!")'
+    description: "Heat alert"
+
+  - id: alert_cold
+    kind: listener
+    watch: heat_index
+    condition: "heat_index < 5"
+    action: 'console.log("❄️ It is cold!")'
+    description: "Cold alert"
