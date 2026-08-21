@@ -27,7 +27,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-          cache: npm
 
       - name: Install dependencies
         run: npm ci || npm install
@@ -49,7 +48,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
       - run: npm ci || npm install
       - name: Lint
         run: npm run lint --if-present || echo "no lint script, skipping"
@@ -62,7 +60,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
       - run: npm ci || npm install
       - name: Audit dependencies
         run: |
