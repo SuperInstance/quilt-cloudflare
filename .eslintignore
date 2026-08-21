@@ -1,0 +1,13 @@
+node_modules/
+dist/
+build/
+target/
+examples/
+landing/
+docs/
+*.config.js
+*.config.cjs
+*.config.mjs
+*.config.ts
+.eslintrc.cjs
+
