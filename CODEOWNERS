@@ -1,0 +1,25 @@
+# CODEOWNERS — automatic review assignments
+#
+# Every PR that touches these paths will automatically request a review
+# from the listed owners. Owners are GitHub usernames.
+#
+# Format: <path> <@user1> <@user2> ...
+# The last matching rule wins.
+#
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for the whole repo
+*       @SuperInstance
+
+# Build and CI configuration deserves a careful eye
+/.github/    @SuperInstance
+/package.json  @SuperInstance
+/Cargo.toml   @SuperInstance
+
+# Public API surface
+/packages/core/src/   @SuperInstance
+/packages/core/src/index.ts   @SuperInstance
+/packages/sdk/src/    @SuperInstance
+/packages/sdk/src/index.ts    @SuperInstance
+/packages/cli/src/    @SuperInstance
+/packages/mcp/src/    @SuperInstance

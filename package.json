@@ -14,7 +14,9 @@
     "vectorize:create": "wrangler vectorize create quilt-embeddings --dimensions=768",
     "kv:create": "wrangler kv:namespace create CACHE",
     "tail": "wrangler tail",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "lint": "eslint . --ext .ts,.js",
+    "lint:fix": "eslint . --ext .ts,.js --fix"
   },
   "keywords": [
     "quilt",
@@ -30,8 +32,11 @@
   "author": "SuperInstance",
   "license": "MIT",
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240000.0",
-    "typescript": "^5.3.0",
-    "wrangler": "^3.0.0"
+    "@cloudflare/workers-types": "^5.20260816.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.123.0",
+    "eslint": "^10.8.1",
+    "@typescript-eslint/parser": "^8.67.0",
+    "@typescript-eslint/eslint-plugin": "^8.67.0"
   }
 }
