@@ -33,9 +33,9 @@
   "license": "MIT",
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260816.1",
-    "typescript": "^7.0.2",
+    "typescript": "^5.9.3",
     "wrangler": "^4.123.0",
-    "eslint": "^10.8.1",
+    "eslint": "^8.57.1",
     "@typescript-eslint/parser": "^8.67.0",
     "@typescript-eslint/eslint-plugin": "^8.67.0"
   }
