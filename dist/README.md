@@ -1,0 +1,1 @@
+This folder contains the built output assets for the worker "quilt-cloudflare" generated at 2026-08-26T16:18:20.199Z.
