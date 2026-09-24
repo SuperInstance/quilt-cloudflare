@@ -794,7 +794,7 @@ export class QuiltEngine {
 // ============================================================================
 
 import {
-  oceanAsk, oceanStats, oceanRecent, checkRate,
+  oceanAsk, oceanStats, oceanRecent, checkRate, tideStats,
   OCEAN_MODEL, type OceanAI, type OceanVector,
 } from './ocean.ts';
 
@@ -954,6 +954,7 @@ async function handleOcean(req: Request, env: Env, url: URL): Promise<Response> 
   if (url.pathname === '/api/ocean/stats' && req.method === 'GET') {
     const s = await oceanStats(kv!);
     const log = JSON.parse(await kv!.get('ocean_calls') ?? '[]') as Array<{ ms: number; source: string }>;
+    const tide = await tideStats(kv!);
     return Response.json({
       // landing-page contract (landing/ocean.html in SuperInstance/quilt)
       calls_total: s.calls,
@@ -961,6 +962,12 @@ async function handleOcean(req: Request, env: Env, url: URL): Promise<Response> 
       hit_rate: s.hit_rate,
       tokens_saved_estimate: s.ocean_hits * 800, // ⚡ rows never ran the model
       cost_curve: log.slice(-30).map(r => r.ms),
+      // the tide, best-effort: never 500s (tideStats swallows its own errors)
+      hourly_cap_usd: tide.hourly_cap_usd,
+      budget_window_usd: tide.budget_window_usd,
+      budget_remaining_usd: tide.budget_remaining_usd,
+      window_reset_in_seconds: tide.window_reset_in_seconds,
+      window_minutes: tide.window_minutes,
       // witness-native fields
       refusals: s.refusals,
       tip: s.tip,
@@ -983,6 +990,16 @@ async function handleOcean(req: Request, env: Env, url: URL): Promise<Response> 
       rate,
     );
     if ('refused' in result) {
+      // Tide-out is its own contract: the landing page keys on error==='tide_out'
+      // to show the "ocean still answers from memory" line.
+      if (result.tide) {
+        return Response.json({
+          error: 'tide_out',
+          retry_after_seconds: result.tide.retry_after_seconds,
+          budget_window_usd: result.tide.budget_window_usd,
+          hourly_cap_usd: result.tide.hourly_cap_usd,
+        }, { status: 429, headers: corsHeaders() });
+      }
       const status = result.reason === 'empty question' || result.reason === 'question too long' ? 400 : 429;
       return Response.json({
         refused: true,
@@ -1003,6 +1020,8 @@ async function handleOcean(req: Request, env: Env, url: URL): Promise<Response> 
       sim: result.sim,
       wave: result.source === 'ocean' ? '⚡' : '🧠',
       seq: result.row.seq,
+      // present only when a ⚡ hit was served with the tide out
+      ...(result.tide ? { tide: result.tide } : {}),
     }, { headers: corsHeaders() });
   }
 
