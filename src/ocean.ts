@@ -28,7 +28,7 @@ export {
 export const OCEAN_HIT_THRESHOLD = 0.92;
 export const OCEAN_LOG_KEY = 'ocean_calls';
 export const OCEAN_LOG_CAP = 5000;
-export const OCEAN_MODEL = '@cf/meta/llama-3.1-8b-instruct';
+export const OCEAN_MODEL = '@cf/meta/llama-3.1-8b-instruct-fp8';
 
 // Per-IP token bucket: 10/min, 100/day — unchanged, and still checked before
 // the tide. The old flat 5000/day global counter is gone: the global limit is
