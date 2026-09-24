@@ -13,15 +13,28 @@
 //  fakes. The route glue lives in worker.ts.
 // =============================================================================
 
+import {
+  tideGate, tideIsOut, tideSpend,
+  HOURLY_CAP_USD, tideWindowBudgetMicro,
+} from './tide.ts';
+
+export {
+  createTideWindow, estimateCostMicroUsd, readTideWindow, tideGate, tideIsOut, tideSpend, tideStats,
+  HOURLY_CAP_USD, TIDE_KV_KEY, tideWindowBudgetMicro,
+  WINDOW_MIN_MINUTES, WINDOW_MAX_MINUTES,
+  type TideGate, type TideWindow,
+} from './tide.ts';
+
 export const OCEAN_HIT_THRESHOLD = 0.92;
 export const OCEAN_LOG_KEY = 'ocean_calls';
 export const OCEAN_LOG_CAP = 5000;
 export const OCEAN_MODEL = '@cf/meta/llama-3-8b-instruct';
 
-// Per-IP token bucket: 10/min, 100/day. Global safety: 5000/day.
+// Per-IP token bucket: 10/min, 100/day — unchanged, and still checked before
+// the tide. The old flat 5000/day global counter is gone: the global limit is
+// now the dollar-metered leaky tide in tide.ts (HOURLY_CAP_USD per hour).
 export const RATE_PER_MINUTE = 10;
 export const RATE_PER_DAY_IP = 100;
-export const RATE_PER_DAY_GLOBAL = 5000;
 
 // fnv-1a 64-bit, hex16 lowercase, no 0x — the same recipe the executor
 // pins, so a row born here re-derives anywhere the chart is known.
@@ -109,6 +122,7 @@ export interface OceanDeps {
   vector: OceanVector;
   kv: OceanKV;
   now?: () => number;
+  rand?: () => number; // tide window dice; defaults to Math.random
 }
 
 export interface OceanAnswer {
@@ -116,7 +130,20 @@ export interface OceanAnswer {
   source: 'ocean' | 'wave';
   sim: number | null;
   row: OceanRow;
+  // Present on an ⚡ hit served while the tide is out: fresh inference is
+  // budget-blocked, but the ocean still answers from memory.
+  tide?: 'serving_from_memory';
 }
+
+export interface TideOutInfo {
+  retry_after_seconds: number;
+  budget_window_usd: number;
+  hourly_cap_usd: number;
+}
+
+export type OceanResult =
+  | OceanAnswer
+  | { refused: true; reason: string; row: OceanRow; tide?: TideOutInfo };
 
 export async function loadLog(kv: OceanKV): Promise<OceanRow[]> {
   const raw = await kv.get(OCEAN_LOG_KEY);
@@ -128,12 +155,13 @@ export async function oceanAsk(
   deps: OceanDeps,
   question: string,
   rate?: { allowed: boolean; reason?: string },
-): Promise<OceanAnswer | { refused: true; reason: string; row: OceanRow }> {
+): Promise<OceanResult> {
   const now = deps.now ?? Date.now;
+  const rand = deps.rand ?? Math.random;
   const log = await loadLog(deps.kv);
   const prev = log.length ? log[log.length - 1] : null;
 
-  const refuse = async (reason: string) => {
+  const refuse = async (reason: string, tide?: TideOutInfo) => {
     const row = makeRow(prev, {
       question_hash: fnv1a64(question),
       answer_hash: fnv1a64(''),
@@ -144,7 +172,7 @@ export async function oceanAsk(
       ts: now(),
     });
     await appendLog(deps.kv, [...log, row]);
-    return { refused: true as const, reason, row };
+    return { refused: true as const, reason, row, ...(tide ? { tide } : {}) };
   };
 
   if (rate && !rate.allowed) return refuse(rate.reason ?? 'rate limited');
@@ -158,8 +186,12 @@ export async function oceanAsk(
   const best = neighbors[0];
 
   if (best && best.score >= OCEAN_HIT_THRESHOLD) {
-    // ⚡ ocean: serve the remembered answer
+    // ⚡ ocean: serve the remembered answer. Hits bypass the budget by
+    // design — Vectorize dims cost ~$0.000008 and the first 30M/mo are free.
+    // When the tide is out we still answer 200, flagged, instead of queuing
+    // behind fresh inference: the ocean gets cheaper under load.
     const answer = best.id; // vector id IS the answer text (see worker glue)
+    const tideOut = await tideIsOut(deps.kv, q, now());
     const row = makeRow(prev, {
       question_hash: fnv1a64(q),
       answer_hash: fnv1a64(answer),
@@ -170,10 +202,27 @@ export async function oceanAsk(
       ts: now(),
     });
     await appendLog(deps.kv, [...log, row]);
-    return { answer, source: 'ocean', sim: best.score, row };
+    return {
+      answer,
+      source: 'ocean',
+      sim: best.score,
+      row,
+      ...(tideOut ? { tide: 'serving_from_memory' as const } : {}),
+    };
   }
 
-  // 🧠 wave: real inference, then teach the ocean
+  // 🧠 wave: fresh inference — the only path the tide meters. Reserve the
+  // estimated cost before the model call; an expired window is rolled fresh
+  // by tideGate, so a new tide always answers the first sailor.
+  const gate = await tideGate(deps.kv, q, now(), rand);
+  if (!gate.allowed) {
+    return refuse('the tide is out — fresh inference budget exhausted', {
+      retry_after_seconds: gate.retryAfterSeconds,
+      budget_window_usd: tideWindowBudgetMicro(gate.window.window_minutes) / 1_000_000,
+      hourly_cap_usd: HOURLY_CAP_USD,
+    });
+  }
+  await tideSpend(deps.kv, gate);
   const answer = await deps.ai.complete(q);
   await deps.vector.insert(answer, vec, { q, answer });
   const row = makeRow(prev, {
@@ -195,29 +244,29 @@ async function appendLog(kv: OceanKV, rows: OceanRow[]): Promise<void> {
 
 // --- rate limiting (token bucket in KV, honest best-effort) -----------------
 
-export function bucketKeys(ip: string, day: string): { min: string; day: string; global: string } {
+export function bucketKeys(ip: string, day: string): { min: string; day: string } {
   const safe = fnv1a64(ip);
   return {
     min: `ocean_rate:min:${safe}:${day}:${Math.floor(Date.now() / 60000)}`,
     day: `ocean_rate:day:${safe}:${day}`,
-    global: `ocean_rate:global:${day}`,
   };
 }
 
 export interface RateDecision { allowed: boolean; reason?: string; headers?: Record<string, string> }
 
+// Per-IP only. The flat global counter this function used to keep is replaced
+// by the tide (tide.ts): a dollar budget is a strictly better global limit —
+// it bounds cost, not ask-count, so a memory-heavy hour answers thousands of
+// ⚡ hits while fresh inference spends real cents.
 export async function checkRate(kv: OceanKV, ip: string): Promise<RateDecision> {
   const day = new Date().toISOString().slice(0, 10);
   const keys = bucketKeys(ip, day);
-  const g = Number(await kv.get(keys.global) ?? '0');
-  if (g >= RATE_PER_DAY_GLOBAL) return { allowed: false, reason: 'ocean is at its daily global limit' };
   const d = Number(await kv.get(keys.day) ?? '0');
   if (d >= RATE_PER_DAY_IP) return { allowed: false, reason: 'daily per-sailor limit reached' };
   const m = Number(await kv.get(keys.min) ?? '0');
   if (m >= RATE_PER_MINUTE) return { allowed: false, reason: 'slow down — 10 questions per minute' };
   await kv.put(keys.min, String(m + 1));
   await kv.put(keys.day, String(d + 1));
-  await kv.put(keys.global, String(g + 1));
   return { allowed: true };
 }
 
