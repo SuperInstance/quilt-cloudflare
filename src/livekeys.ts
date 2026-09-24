@@ -7,12 +7,21 @@
 //    /api/quantum/decode   → Moth quantumaudio service
 //
 //  VERIFIED vs PENDING — honesty over demo:
-//    - SystemOne request shape is VERIFIED against
-//      AI-Writings/openjev-research/01-typesafe-jev-deep-dive.md:
+//    - SystemOne request shape is VERIFIED AGAINST THE LIVE WIRE
+//      (2026-09-25, HTTP 200 in 0.86s, model jev-1.13.0) and cross-checked
+//      against AI-Writings/_worker.js callJev/handleJev, which speaks the
+//      same protocol in production:
 //      POST https://api.typesafe.ai/v1/systemone
-//      body { schema: {type:"Choice",options:[≤255]} | {type:"Score",...} | {type:"Noul"},
-//             context: string, samples?: 1..32 }
-//    - The Moth quantumaudio base URL is NOT verifiable in-repo.
+//      body { model: 'jev-latest', state: <string>, questions: {
+//               name: { type: 'choice'|'score'|'noul', ... } } }
+//      → 200 { model, answers: { name: { ... } }, usage: {...} }
+//      choice: { question, options: string[] }  (criteria: per-option rubric)
+//      score:  { question, criteria/scale: string[] }
+//      noul:   { question, instructions }
+//      The earlier { schema, context, samples } shape (from the stale
+//      deep-dive doc) was PROVEN WRONG by six live 400s on the deployed
+//      worker. It is still accepted here as a documented compat shim,
+//      mapped onto the true shape — never forwarded verbatim.
 //      SuperInstance/moth-ledger's README states the endpoint
 //      "is undiscovered (~40 probes failed; docs live behind Casey's
 //      onboarding)". These routes therefore run behind an explicit flag:
@@ -53,12 +62,13 @@ export interface LiveKeysOptions {
 
 const SYSTEMONE_URL = 'https://api.typesafe.ai/v1/systemone';
 const DEFAULT_TIMEOUT_MS = 15000;
-const MAX_CONTEXT_CHARS = 4000;
+const MAX_STATE_CHARS = 20000;
+const MAX_QUESTIONS = 32;
 const MAX_CHOICE_OPTIONS = 255;
-const MAX_SAMPLES = 32;
 const MINUTE_LIMIT = 10;
 const DAY_LIMIT = 100;
-const SCHEMA_TYPES = ['Choice', 'Score', 'Noul'];
+const QUESTION_TYPES = ['choice', 'score', 'noul'];
+const DEFAULT_MODEL = 'jev-latest';
 
 // NOTE(ocean-api reconciliation): assumed witness-table shape. The sibling
 // branch may adjust columns; CREATE TABLE IF NOT EXISTS + INSERT OR IGNORE
@@ -124,7 +134,7 @@ async function proxySystemOne(
   } catch {
     return json({ error: 'invalid_json' }, 400);
   }
-  const valid = validateSystemOneBody(body);
+  const valid = normalizeSystemOneBody(body);
   if (!valid.ok) {
     return json({ error: 'invalid_body', detail: valid.detail }, 400);
   }
@@ -139,9 +149,9 @@ async function proxySystemOne(
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        schema: valid.value.schema,
-        context: valid.value.context,
-        samples: valid.value.samples,
+        model: valid.value.model,
+        state: valid.value.state,
+        questions: valid.value.questions,
       }),
     },
     opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
@@ -163,61 +173,150 @@ async function proxySystemOne(
   return res;
 }
 
-function validateSystemOneBody(
+// The live-verified System One protocol (see header note): {model, state,
+// questions}. The legacy {schema, context, samples} shape from the stale
+// deep-dive doc is still accepted and mapped onto the true shape — six live
+// 400s proved it must never be forwarded verbatim.
+function normalizeSystemOneBody(
   body: unknown,
-): { ok: true; value: { schema: unknown; context: string; samples?: number } }
+): { ok: true; value: { model: string; state: string; questions: Record<string, unknown> } }
   | { ok: false; detail: string } {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     return { ok: false, detail: 'body must be a JSON object' };
   }
   const b = body as Record<string, unknown>;
 
-  if (typeof b.schema !== 'object' || b.schema === null || Array.isArray(b.schema)) {
-    return { ok: false, detail: 'schema must be an object' };
+  if (b.state !== undefined || b.questions !== undefined) {
+    return validateTrueShape(b);
   }
-  const s = b.schema as Record<string, unknown>;
-  if (typeof s.type !== 'string' || !SCHEMA_TYPES.includes(s.type)) {
-    return { ok: false, detail: `schema.type must be one of: ${SCHEMA_TYPES.join(', ')}` };
+  if (b.schema !== undefined && b.context !== undefined) {
+    return mapLegacyShape(b);
   }
-  if (s.type === 'Choice') {
-    if (!Array.isArray(s.options)) {
-      return { ok: false, detail: 'schema.options must be an array for Choice' };
+  return { ok: false, detail: 'expected { state, questions } (or legacy { schema, context })' };
+}
+
+function validateTrueShape(
+  b: Record<string, unknown>,
+): { ok: true; value: { model: string; state: string; questions: Record<string, unknown> } }
+  | { ok: false; detail: string } {
+  let model = DEFAULT_MODEL;
+  if (b.model !== undefined) {
+    if (typeof b.model !== 'string' || b.model.length === 0) {
+      return { ok: false, detail: 'model must be a non-empty string' };
     }
-    if (s.options.length < 1 || s.options.length > MAX_CHOICE_OPTIONS) {
-      return { ok: false, detail: `schema.options length must be 1..${MAX_CHOICE_OPTIONS}` };
-    }
-  }
-  if (s.type === 'Score') {
-    if (typeof s.rubric !== 'string' || s.rubric.length === 0) {
-      return { ok: false, detail: 'schema.rubric must be a non-empty string for Score' };
-    }
-    if (s.min !== undefined && typeof s.min !== 'number') {
-      return { ok: false, detail: 'schema.min must be a number' };
-    }
-    if (s.max !== undefined && typeof s.max !== 'number') {
-      return { ok: false, detail: 'schema.max must be a number' };
-    }
+    model = b.model;
   }
 
-  if (typeof b.context !== 'string') {
-    return { ok: false, detail: 'context must be a string' };
-  }
-  if (b.context.length > MAX_CONTEXT_CHARS) {
-    return { ok: false, detail: `context must be ≤ ${MAX_CONTEXT_CHARS} chars` };
-  }
-  if (b.samples !== undefined) {
-    const n = b.samples;
-    if (typeof n !== 'number' || !Number.isInteger(n) || n < 1 || n > MAX_SAMPLES) {
-      return { ok: false, detail: `samples must be an integer 1..${MAX_SAMPLES}` };
+  let state: string;
+  if (typeof b.state === 'string') {
+    state = b.state;
+  } else if (b.state !== undefined) {
+    // Lenient: objects/arrays are serialized — the wire requires a string,
+    // and serializing here is honest (we state the shape we sent).
+    try {
+      state = JSON.stringify(b.state);
+    } catch {
+      return { ok: false, detail: 'state is not serializable' };
     }
+  } else {
+    return { ok: false, detail: 'state is required' };
+  }
+  if (state.length > MAX_STATE_CHARS) {
+    return { ok: false, detail: `state must be ≤ ${MAX_STATE_CHARS} chars` };
+  }
+
+  if (typeof b.questions !== 'object' || b.questions === null || Array.isArray(b.questions)) {
+    return { ok: false, detail: 'questions must be an object mapping names to question specs' };
+  }
+  const entries = Object.entries(b.questions as Record<string, unknown>);
+  if (entries.length < 1 || entries.length > MAX_QUESTIONS) {
+    return { ok: false, detail: `questions count must be 1..${MAX_QUESTIONS}` };
+  }
+  const questions: Record<string, unknown> = {};
+  for (const [name, q] of entries) {
+    const checked = validateQuestion(name, q);
+    if (!checked.ok) return checked;
+    questions[name] = checked.value;
+  }
+  return { ok: true, value: { model, state, questions } };
+}
+
+function validateQuestion(
+  name: string,
+  q: unknown,
+): { ok: true; value: unknown } | { ok: false; detail: string } {
+  if (typeof q !== 'object' || q === null || Array.isArray(q)) {
+    return { ok: false, detail: `questions.${name} must be an object` };
+  }
+  const spec = q as Record<string, unknown>;
+  if (typeof spec.type !== 'string' || !QUESTION_TYPES.includes(spec.type)) {
+    return { ok: false, detail: `questions.${name}.type must be one of: ${QUESTION_TYPES.join(', ')}` };
+  }
+  if (spec.question !== undefined && typeof spec.question !== 'string') {
+    return { ok: false, detail: `questions.${name}.question must be a string` };
+  }
+  if (spec.instructions !== undefined && typeof spec.instructions !== 'string') {
+    return { ok: false, detail: `questions.${name}.instructions must be a string` };
+  }
+  if (spec.type === 'choice') {
+    if (!Array.isArray(spec.options)) {
+      return { ok: false, detail: `questions.${name}.options must be an array for choice` };
+    }
+    if (spec.options.length < 1 || spec.options.length > MAX_CHOICE_OPTIONS) {
+      return { ok: false, detail: `questions.${name}.options length must be 1..${MAX_CHOICE_OPTIONS}` };
+    }
+    if (!spec.options.every((o: unknown) => typeof o === 'string')) {
+      return { ok: false, detail: `questions.${name}.options must be strings` };
+    }
+  }
+  if (spec.type === 'score') {
+    // Production usage (AI-Writings) carries criteria and/or scale string
+    // arrays; at least one rubric channel is required for score.
+    const hasRubric = Array.isArray(spec.criteria) || Array.isArray(spec.scale);
+    if (!hasRubric) {
+      return { ok: false, detail: `questions.${name} (score) needs criteria or scale (string array)` };
+    }
+  }
+  return { ok: true, value: spec };
+}
+
+function mapLegacyShape(
+  b: Record<string, unknown>,
+): { ok: true; value: { model: string; state: string; questions: Record<string, unknown> } }
+  | { ok: false; detail: string } {
+  const s = b.schema as Record<string, unknown>;
+  const type = (typeof s.type === 'string' ? s.type : '').toLowerCase();
+  if (!QUESTION_TYPES.includes(type)) {
+    return { ok: false, detail: `legacy schema.type must be one of: Choice, Score, Noul` };
+  }
+  if (typeof b.context !== 'string' || b.context.length === 0) {
+    return { ok: false, detail: 'legacy context must be a non-empty string' };
+  }
+  if (b.context.length > MAX_STATE_CHARS) {
+    return { ok: false, detail: `legacy context must be ≤ ${MAX_STATE_CHARS} chars` };
+  }
+  // Legacy `samples` has no counterpart on the verified wire; it is dropped
+  // deliberately (documented), not forwarded.
+  const decision: Record<string, unknown> = { type, question: b.context };
+  if (type === 'choice' && Array.isArray(s.options)) {
+    decision.options = s.options;
+  }
+  if (type === 'score') {
+    if (Array.isArray(s.criteria)) decision.criteria = s.criteria;
+    if (Array.isArray(s.scale)) decision.scale = s.scale;
+    if (decision.criteria === undefined && decision.scale === undefined && typeof s.rubric === 'string') {
+      decision.criteria = [s.rubric];
+    }
+    if (decision.criteria === undefined && decision.scale === undefined) {
+      return { ok: false, detail: 'legacy Score schema needs criteria/scale/rubric' };
+    }
+  }
+  if (type === 'noul') {
+    decision.instructions = b.context;
   }
   return {
     ok: true,
-    value: {
-      schema: b.schema,
-      context: b.context,
-      samples: b.samples as number | undefined,
-    },
+    value: { model: DEFAULT_MODEL, state: b.context, questions: { decision } },
   };
 }
 

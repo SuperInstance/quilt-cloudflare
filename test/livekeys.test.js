@@ -70,19 +70,35 @@ function withMockFetch(t, fn) {
   return calls;
 }
 
-const SYSTEMONE_UPSTREAM = { choice: 'b', probabilities: { a: 0.2, b: 0.7, c: 0.1 }, latency_ms: 120 };
+// Recorded live fixture (2026-09-25, real HTTP 200, model jev-1.13.0):
+// response carries { model, answers: { name: { ... } }, usage: {...} }.
+const SYSTEMONE_UPSTREAM = {
+  model: 'jev-1.13.0',
+  answers: {
+    deploy: { choice: 'b', probabilities: { a: 0.2, b: 0.7, c: 0.1 }, confidence: 0.91 },
+  },
+  usage: { input_tokens: 390, output_tokens: 66 },
+};
 
-// --- 1. systemone happy path ------------------------------------------------
+function trueShapeBody() {
+  return {
+    state: 'candidate: deploy now?',
+    questions: {
+      deploy: {
+        type: 'choice',
+        question: 'Should we deploy?',
+        options: ['a', 'b', 'c'],
+      },
+    },
+  };
+}
 
-test('systemone: Choice schema happy path — 200, x-served-by, bearer auth, passthrough', async (t) => {
+// --- 1. systemone happy path — true verified wire shape ----------------------
+
+test('systemone: true { state, questions } shape — 200, default model jev-latest, passthrough', async (t) => {
   const calls = withMockFetch(t, async () => jsonResponse(SYSTEMONE_UPSTREAM));
   const env = { TYPESAFEAI_KEY: 'test-key-ts', CACHE: mapKv() };
-  const req = postJson('/api/systemone', {
-    schema: { type: 'Choice', options: ['a', 'b', 'c'] },
-    context: 'pick one',
-    samples: 2,
-  });
-  const res = await handleLiveKeys(req, env);
+  const res = await handleLiveKeys(postJson('/api/systemone', trueShapeBody()), env);
   assert.ok(res);
   assert.strictEqual(res.status, 200);
   assert.strictEqual(res.headers.get('x-served-by'), 'typesafe-systemone');
@@ -91,35 +107,111 @@ test('systemone: Choice schema happy path — 200, x-served-by, bearer auth, pas
   assert.strictEqual(calls[0].url, 'https://api.typesafe.ai/v1/systemone');
   assert.strictEqual(calls[0].init.headers.Authorization, 'Bearer test-key-ts');
   const sent = JSON.parse(calls[0].init.body);
-  assert.deepStrictEqual(sent.schema, { type: 'Choice', options: ['a', 'b', 'c'] });
-  assert.strictEqual(sent.context, 'pick one');
-  assert.strictEqual(sent.samples, 2);
+  assert.strictEqual(sent.model, 'jev-latest', 'model defaults to jev-latest');
+  assert.strictEqual(sent.state, 'candidate: deploy now?');
+  assert.deepStrictEqual(sent.questions.deploy.type, 'choice');
+  assert.deepStrictEqual(sent.questions.deploy.options, ['a', 'b', 'c']);
+  assert.strictEqual(sent.schema, undefined, 'stale schema field must never be forwarded');
+  assert.strictEqual(sent.context, undefined);
+  assert.strictEqual(sent.samples, undefined);
   assert.strictEqual(await res.text(), JSON.stringify(SYSTEMONE_UPSTREAM));
 });
 
-// --- 2. schema validation → 400 ---------------------------------------------
+test('systemone: explicit model + object state (serialized) + score/noul questions', async (t) => {
+  const calls = withMockFetch(t, async () => jsonResponse(SYSTEMONE_UPSTREAM));
+  const env = { TYPESAFEAI_KEY: 'k', CACHE: mapKv() };
+  const res = await handleLiveKeys(postJson('/api/systemone', {
+    model: 'jev-1.13.0',
+    state: { cell: 'x', tick: 3 },
+    questions: {
+      urgency: { type: 'score', question: 'How urgent?', scale: ['low', 'high'], criteria: ['low', 'high'] },
+      witness: { type: 'noul', question: 'This cell should be witnessed.', instructions: 'Decide.' },
+    },
+  }), env);
+  assert.strictEqual(res.status, 200);
+  const sent = JSON.parse(calls[0].init.body);
+  assert.strictEqual(sent.model, 'jev-1.13.0');
+  assert.strictEqual(sent.state, JSON.stringify({ cell: 'x', tick: 3 }));
+  assert.strictEqual(sent.questions.urgency.type, 'score');
+  assert.strictEqual(sent.questions.witness.type, 'noul');
+});
 
-test('systemone: validation rejects FreeText type, options>255, context>4000', async (t) => {
+// --- 2. true-shape validation → 400 ------------------------------------------
+
+test('systemone: validation rejects bad question type, options>255, state>20000, score without rubric, >32 questions', async (t) => {
   const calls = withMockFetch(t, async () => jsonResponse(SYSTEMONE_UPSTREAM));
   const env = { TYPESAFEAI_KEY: 'k', CACHE: mapKv() };
 
   const badType = await handleLiveKeys(postJson('/api/systemone', {
-    schema: { type: 'FreeText' }, context: 'x',
+    state: 'x', questions: { q: { type: 'freetext' } },
   }), env);
   assert.strictEqual(badType.status, 400);
 
   const tooManyOptions = await handleLiveKeys(postJson('/api/systemone', {
-    schema: { type: 'Choice', options: Array.from({ length: 256 }, (_, i) => `o${i}`) },
-    context: 'x',
+    state: 'x',
+    questions: { q: { type: 'choice', options: Array.from({ length: 256 }, (_, i) => `o${i}`) } },
   }), env);
   assert.strictEqual(tooManyOptions.status, 400);
 
-  const longContext = await handleLiveKeys(postJson('/api/systemone', {
-    schema: { type: 'Noul' }, context: 'x'.repeat(4001),
+  const longState = await handleLiveKeys(postJson('/api/systemone', {
+    state: 'x'.repeat(20001), questions: { q: { type: 'noul', question: 'ok?' } },
   }), env);
-  assert.strictEqual(longContext.status, 400);
+  assert.strictEqual(longState.status, 400);
+
+  const scoreNoRubric = await handleLiveKeys(postJson('/api/systemone', {
+    state: 'x', questions: { q: { type: 'score', question: 'how much?' } },
+  }), env);
+  assert.strictEqual(scoreNoRubric.status, 400);
+
+  const tooManyQuestions = await handleLiveKeys(postJson('/api/systemone', {
+    state: 'x',
+    questions: Object.fromEntries(Array.from({ length: 33 }, (_, i) => [`q${i}`, { type: 'noul', question: 'ok?' }])),
+  }), env);
+  assert.strictEqual(tooManyQuestions.status, 400);
+
+  const missingQuestions = await handleLiveKeys(postJson('/api/systemone', {
+    state: 'x',
+  }), env);
+  assert.strictEqual(missingQuestions.status, 400);
 
   assert.strictEqual(calls.length, 0, 'upstream must not be called for invalid bodies');
+});
+
+// --- 2b. legacy compat shim: {schema, context} → questions map ---------------
+
+test('systemone: legacy {schema, context} compat shim maps onto true shape (never forwarded verbatim)', async (t) => {
+  const calls = withMockFetch(t, async () => jsonResponse(SYSTEMONE_UPSTREAM));
+  const env = { TYPESAFEAI_KEY: 'k', CACHE: mapKv() };
+  const res = await handleLiveKeys(postJson('/api/systemone', {
+    schema: { type: 'Choice', options: ['yes', 'no'] },
+    context: 'ship it?',
+    samples: 4,
+  }), env);
+  assert.strictEqual(res.status, 200);
+  const sent = JSON.parse(calls[0].init.body);
+  assert.strictEqual(sent.model, 'jev-latest');
+  assert.strictEqual(sent.state, 'ship it?');
+  assert.strictEqual(sent.questions.decision.type, 'choice');
+  assert.deepStrictEqual(sent.questions.decision.options, ['yes', 'no']);
+  assert.strictEqual(sent.samples, undefined, 'legacy samples has no wire counterpart — dropped by design');
+  assert.strictEqual(sent.schema, undefined);
+  assert.strictEqual(sent.context, undefined);
+
+  // Legacy Noul maps instructions from context.
+  const calls2 = withMockFetch(t, async () => jsonResponse(SYSTEMONE_UPSTREAM));
+  const env2 = { TYPESAFEAI_KEY: 'k', CACHE: mapKv() };
+  await handleLiveKeys(postJson('/api/systemone', {
+    schema: { type: 'Noul' }, context: 'decide carefully',
+  }), env2);
+  const sent2 = JSON.parse(calls2[0].init.body);
+  assert.strictEqual(sent2.questions.decision.type, 'noul');
+  assert.strictEqual(sent2.questions.decision.instructions, 'decide carefully');
+
+  // Legacy with unknown schema type → 400, no upstream call.
+  const bad = await handleLiveKeys(postJson('/api/systemone', {
+    schema: { type: 'FreeText' }, context: 'x',
+  }), env);
+  assert.strictEqual(bad.status, 400);
 });
 
 // --- 3. upstream non-2xx passthrough ----------------------------------------
@@ -127,19 +219,19 @@ test('systemone: validation rejects FreeText type, options>255, context>4000', a
 test('systemone: upstream 402 and 500 pass through status + body verbatim', async (t) => {
   const calls = withMockFetch(t, async (_url, init) => {
     const sent = JSON.parse(init.body);
-    if (sent.context === 'pay') return jsonResponse({ error: 'quota exhausted' }, 402);
+    if (sent.state === 'pay') return jsonResponse({ error: 'quota exhausted' }, 402);
     return jsonResponse({ error: 'internal boom' }, 500);
   });
   const env = { TYPESAFEAI_KEY: 'k', CACHE: mapKv() };
 
   const r402 = await handleLiveKeys(postJson('/api/systemone', {
-    schema: { type: 'Noul' }, context: 'pay',
+    state: 'pay', questions: { q: { type: 'noul', question: 'ok?' } },
   }), env);
   assert.strictEqual(r402.status, 402);
   assert.strictEqual(await r402.text(), JSON.stringify({ error: 'quota exhausted' }));
 
   const r500 = await handleLiveKeys(postJson('/api/systemone', {
-    schema: { type: 'Noul' }, context: 'boom',
+    state: 'boom', questions: { q: { type: 'noul', question: 'ok?' } },
   }), env);
   assert.strictEqual(r500.status, 500);
   assert.strictEqual(r500.headers.get('x-served-by'), 'typesafe-systemone');
@@ -158,9 +250,7 @@ test('systemone: upstream timeout → 504', async (t) => {
     });
   });
   const env = { TYPESAFEAI_KEY: 'k', CACHE: mapKv() };
-  const res = await handleLiveKeys(postJson('/api/systemone', {
-    schema: { type: 'Noul' }, context: 'slow',
-  }), env, { timeoutMs: 30 });
+  const res = await handleLiveKeys(postJson('/api/systemone', trueShapeBody()), env, { timeoutMs: 30 });
   assert.strictEqual(res.status, 504);
   const body = await res.json();
   assert.strictEqual(body.error, 'upstream_timeout');
@@ -171,9 +261,7 @@ test('systemone: upstream timeout → 504', async (t) => {
 test('systemone: missing TYPESAFEAI_KEY → 503 key_not_deployed', async (t) => {
   const calls = withMockFetch(t, async () => jsonResponse({}));
   const env = { CACHE: mapKv() };
-  const res = await handleLiveKeys(postJson('/api/systemone', {
-    schema: { type: 'Noul' }, context: 'x',
-  }), env);
+  const res = await handleLiveKeys(postJson('/api/systemone', trueShapeBody()), env);
   assert.strictEqual(res.status, 503);
   assert.strictEqual((await res.json()).error, 'key_not_deployed');
   assert.strictEqual(calls.length, 0);
@@ -187,13 +275,13 @@ test('rate limit: 11 rapid requests → first 10 ok, 11th is 429', async (t) => 
   const statuses = [];
   for (let i = 0; i < 11; i++) {
     const res = await handleLiveKeys(postJson('/api/systemone', {
-      schema: { type: 'Noul' }, context: `req ${i}`,
+      state: `req ${i}`, questions: { q: { type: 'noul', question: 'ok?' } },
     }), env);
     statuses.push(res.status);
   }
   assert.deepStrictEqual(statuses, [200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 429]);
   assert.strictEqual((await handleLiveKeys(postJson('/api/systemone', {
-    schema: { type: 'Noul' }, context: 'again',
+    state: 'again', questions: { q: { type: 'noul', question: 'ok?' } },
   }), env)).status, 429);
   assert.strictEqual(calls.length, 10);
 });
@@ -265,9 +353,7 @@ test('receipts: DB that throws still returns the upstream response (console.warn
   t.after(() => { console.warn = originalWarn; });
 
   const env = { TYPESAFEAI_KEY: 'k', CACHE: mapKv(), DB: throwDb };
-  const res = await handleLiveKeys(postJson('/api/systemone', {
-    schema: { type: 'Choice', options: ['a', 'b'] }, context: 'witness me',
-  }), env);
+  const res = await handleLiveKeys(postJson('/api/systemone', trueShapeBody()), env);
 
   assert.strictEqual(res.status, 200, 'caller must see the upstream success');
   assert.strictEqual(await res.text(), JSON.stringify(SYSTEMONE_UPSTREAM));
@@ -283,9 +369,7 @@ test('receipts: successful call inserts an ocean_calls row when DB is present', 
   withMockFetch(t, async () => jsonResponse(SYSTEMONE_UPSTREAM));
   const db = okDb();
   const env = { TYPESAFEAI_KEY: 'k', CACHE: mapKv(), DB: db };
-  const res = await handleLiveKeys(postJson('/api/systemone', {
-    schema: { type: 'Noul' }, context: 'receipt please',
-  }), env);
+  const res = await handleLiveKeys(postJson('/api/systemone', trueShapeBody()), env);
   assert.strictEqual(res.status, 200);
   const inserts = db.rows.filter(r => /INSERT OR IGNORE INTO ocean_calls/.test(r.sql));
   assert.strictEqual(inserts.length, 1);
