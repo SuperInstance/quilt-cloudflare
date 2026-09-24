@@ -793,6 +793,11 @@ export class QuiltEngine {
 //  Worker entry point
 // ============================================================================
 
+import {
+  oceanAsk, oceanStats, oceanRecent, checkRate,
+  OCEAN_MODEL, type OceanAI, type OceanVector,
+} from './ocean.ts';
+
 export interface Env {
   DB: D1Database;
   VECTORIZE?: VectorizeIndex;
@@ -857,6 +862,10 @@ export default {
         return handleMCP(req, env, ctx);
       }
 
+      if (url.pathname.startsWith('/api/ocean/')) {
+        return handleOcean(req, env, url);
+      }
+
       if (url.pathname === '/mcp/sse') {
         return handleMCPStream(req, env, ctx);
       }
@@ -883,6 +892,121 @@ function corsHeaders(): Record<string, string> {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
   };
+}
+
+// --- The Ocean: witnessed inference surface ---------------------------------
+
+function oceanAI(ai: Ai): OceanAI {
+  return {
+    async embed(text: string) {
+      const res = await ai.run('@cf/baai/bge-base-en-v1.5', { text: [text] });
+      return (res as any).data[0] as number[];
+    },
+    async complete(prompt: string) {
+      const res = await ai.run(OCEAN_MODEL, {
+        messages: [
+          { role: 'system', content: 'You are the Ocean, a concise helpful assistant aboard the Quilt. Answer in at most three sentences.' },
+          { role: 'user', content: prompt },
+        ],
+      });
+      return (res as any).response as string;
+    },
+  };
+}
+
+function oceanVector(index: VectorizeIndex): OceanVector {
+  return {
+    async query(vec: number[], topK: number) {
+      const res = await index.query(vec, { topK, returnMetadata: 'none' });
+      // Vectorize id is the answer text; score is cosine similarity
+      return res.matches.map((m: any) => ({ id: m.id, score: m.score }));
+    },
+    async insert(id: string, vec: number[], metadata: Record<string, unknown>) {
+      await index.insert([{ id, values: vec, metadata }]);
+    },
+  };
+}
+
+function oceanKV(kv: KVNamespace) {
+  return {
+    get: (key: string) => kv.get(key),
+    put: (key: string, value: string) => kv.put(key, value),
+  };
+}
+
+async function handleOcean(req: Request, env: Env, url: URL): Promise<Response> {
+  const kv = env.CACHE ? oceanKV(env.CACHE) : undefined;
+
+  // Health: what bindings does this ocean actually have? Honest, not hopeful.
+  if (url.pathname === '/api/ocean/health' && req.method === 'GET') {
+    return Response.json({
+      ok: true,
+      live: Boolean(env.AI && env.VECTORIZE && env.CACHE),
+      bindings: { ai: Boolean(env.AI), vectorize: Boolean(env.VECTORIZE), kv: Boolean(env.CACHE) },
+      model: OCEAN_MODEL,
+    }, { headers: corsHeaders() });
+  }
+
+  if (!env.AI || !env.VECTORIZE || !env.CACHE) {
+    return Response.json({ error: 'ocean not deployed: needs AI + VECTORIZE + CACHE bindings' }, { status: 503, headers: corsHeaders() });
+  }
+
+  if (url.pathname === '/api/ocean/stats' && req.method === 'GET') {
+    const s = await oceanStats(kv!);
+    const log = JSON.parse(await kv!.get('ocean_calls') ?? '[]') as Array<{ ms: number; source: string }>;
+    return Response.json({
+      // landing-page contract (landing/ocean.html in SuperInstance/quilt)
+      calls_total: s.calls,
+      ocean_size: s.waves,             // entries taught to the ocean
+      hit_rate: s.hit_rate,
+      tokens_saved_estimate: s.ocean_hits * 800, // ⚡ rows never ran the model
+      cost_curve: log.slice(-30).map(r => r.ms),
+      // witness-native fields
+      refusals: s.refusals,
+      tip: s.tip,
+    }, { headers: corsHeaders() });
+  }
+
+  if (url.pathname === '/api/ocean/recent' && req.method === 'GET') {
+    const n = Math.min(Number(url.searchParams.get('n') ?? '20') || 20, 100);
+    return Response.json(await oceanRecent(kv!, n), { headers: corsHeaders() });
+  }
+
+  if (url.pathname === '/api/ocean/ask' && req.method === 'POST') {
+    const body = await req.json().catch(() => ({})) as { question?: string; prompt?: string };
+    const question = body.question ?? body.prompt ?? '';
+    const ip = req.headers.get('cf-connecting-ip') ?? 'unknown';
+    const rate = await checkRate(kv!, ip);
+    const result = await oceanAsk(
+      { ai: oceanAI(env.AI), vector: oceanVector(env.VECTORIZE), kv: kv! },
+      question,
+      rate,
+    );
+    if ('refused' in result) {
+      const status = result.reason === 'empty question' || result.reason === 'question too long' ? 400 : 429;
+      return Response.json({
+        refused: true,
+        reason: result.reason,
+        row: result.row,
+        retry_after_seconds: status === 429 ? 60 : undefined,
+      }, { status, headers: corsHeaders() });
+    }
+    return Response.json({
+      // landing-page contract
+      answer: result.answer,
+      served: result.source,
+      similarity: result.sim,
+      model: OCEAN_MODEL,
+      witness: result.row.row_hash,
+      // native fields
+      source: result.source,
+      sim: result.sim,
+      wave: result.source === 'ocean' ? '⚡' : '🧠',
+      seq: result.row.seq,
+    }, { headers: corsHeaders() });
+  }
+
+  return new Response('Not found: ' + url.pathname, { status: 404, headers: corsHeaders() });
 }
 
 async function handleMCP(req: Request, _env: Env, _ctx: ExecutionContext): Promise<Response> {
