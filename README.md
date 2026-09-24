@@ -320,6 +320,33 @@ Local dev uses miniflare to emulate Workers, D1, Vectorize, KV, R2.
 
 ---
 
+## 🌊 The Ocean — witnessed inference
+
+`POST /api/ocean/ask` `{ "question": "..." }` embeds the question and looks it
+up in Vectorize. A close neighbor (**cosine ≥ 0.92**) is served straight from
+the ocean (⚡) — no model call. A miss runs a real Workers AI model (🧠,
+`@cf/meta/llama-3-8b-instruct`) and the new pair is upserted, so the ocean
+cheapens with every call. **Every call is booked** as a row in an
+fnv-1a-64 hash-chained receipt log (the witness idiom — same recipe the
+quilt-executor pins, so rows re-derive anywhere the chart is known).
+
+```bash
+curl -X POST https://YOUR_WORKER.workers.dev/api/ocean/ask \
+  -H 'Content-Type: application/json' -d '{"question":"what is a cell?"}'
+# → { "answer": "...", "source": "wave", "sim": null, "wave": "🧠", "witness": "2ee6bf…", "seq": 0 }
+
+curl https://YOUR_WORKER.workers.dev/api/ocean/stats   # calls, hit_rate, chain tip
+curl https://YOUR_WORKER.workers.dev/api/ocean/recent  # last 20 receipt rows
+curl https://YOUR_WORKER.workers.dev/api/ocean/health  # which bindings are live (honest pill)
+```
+
+Rate limits (KV token buckets): 10/min, 100/day per IP; 5k/day global.
+Refusals — rate, empty question, over-length — are **booked as REFUSED rows**,
+never silent. Deploy needs the three bindings: `AI` (`[ai]`),
+`VECTORIZE` (`quilt-embeddings`, 768-dim BGE), `CACHE` (KV). Without them
+`/api/ocean/*` answers `503 ocean not deployed` — the landing page's
+LIVE/OFFLINE pill reads `/api/ocean/health`.
+
 ## 📦 Build targets
 
 ```bash
