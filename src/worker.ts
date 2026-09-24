@@ -694,7 +694,7 @@ export class QuiltEngine {
   private async evalAiLlm(cell: Cell): Promise<any> {
     if (!this.opts.ai) throw new Error('AI not configured');
     const prompt = this.resolveTemplate(cell.config.prompt || '');
-    const model = cell.config.model || '@cf/meta/llama-3.1-8b-instruct';
+    const model = cell.config.model || '@cf/meta/llama-3.1-8b-instruct-fp8';
     return await this.opts.ai.llm(model, prompt, cell.config.max_tokens);
   }
 
@@ -736,7 +736,7 @@ export class QuiltEngine {
     const prompt = this.resolveTemplate(cell.config.prompt || '');
     const lang = cell.config.language || 'python';
     const fullPrompt = `Generate ${lang} code for: ${prompt}. Return only the code, no explanation.`;
-    return await this.opts.ai.llm('@cf/meta/llama-3.1-8b-instruct', fullPrompt, cell.config.max_tokens || 500);
+    return await this.opts.ai.llm('@cf/meta/llama-3.1-8b-instruct-fp8', fullPrompt, cell.config.max_tokens || 500);
   }
 
   private evalRouter(cell: Cell): any {
