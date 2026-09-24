@@ -7,7 +7,7 @@ compatibility_date = "2024-01-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "quilt-db"
-database_id = "your-database-id-here"
+database_id = "d782be6b-b0ab-4dfa-b8f4-cb875bc11fc1"
 
 # Vectorize for semantic cell search
 # Create with: wrangler vectorize create quilt-embeddings --dimensions=768
@@ -19,7 +19,7 @@ index_name = "quilt-embeddings"
 # Create with: wrangler kv:namespace create CACHE
 [[kv_namespaces]]
 binding = "CACHE"
-id = "your-namespace-id-here"
+id = "76094ed27a6447d1bf5627bf33e71fb9"
 
 # Workers AI for LLM cells
 [ai]
@@ -29,10 +29,3 @@ binding = "AI"
 # [triggers]
 # crons = ["*/1 * * * *"]  # every minute
 
-[build]
-command = "echo Building..."
-
-[build.upload]
-format = "modules"
-dir = "src"
-main = "./worker.ts"
