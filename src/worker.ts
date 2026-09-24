@@ -18,6 +18,8 @@
 //  is designed to be deployed to Cloudflare's edge with `wrangler deploy`.
 // =============================================================================
 
+import { handleLiveKeys } from './livekeys.ts';
+
 // ============================================================================
 //  Cell kinds
 // ============================================================================
@@ -869,6 +871,11 @@ export default {
       if (url.pathname === '/mcp/sse') {
         return handleMCPStream(req, env, ctx);
       }
+
+      // Live-key proxies (typesafe SystemOne + Moth quantum) — returns null
+      // for paths that aren't theirs, so fall through is preserved.
+      const lk = await handleLiveKeys(req, env);
+      if (lk) return lk;
 
       return new Response('Not found: ' + url.pathname, { status: 404, headers: corsHeaders() });
     } catch (e: any) {
