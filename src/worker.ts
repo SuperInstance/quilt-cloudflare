@@ -128,9 +128,9 @@ export class D1Storage implements CellStorage {
       .all();
     const cells: Cell[] = (cellsRes.results || []).map((row: any) => {
       let value: any = row.value;
-      try { value = JSON.parse(row.value); } catch (e) {}
+      try { value = JSON.parse(row.value); } catch {}
       let metadata: any = {};
-      try { metadata = row.metadata ? JSON.parse(row.metadata) : {}; } catch (e) {}
+      try { metadata = row.metadata ? JSON.parse(row.metadata) : {}; } catch {}
       return {
         id: row.id,
         kind: row.kind as CellKindType,
@@ -195,7 +195,7 @@ export class D1Storage implements CellStorage {
       .first();
     if (!res) return null;
     try { return { value: JSON.parse((res as any).value), t: (res as any).t }; }
-    catch (e) { return { value: (res as any).value, t: (res as any).t }; }
+    catch { return { value: (res as any).value, t: (res as any).t }; }
   }
 
   async setValue(sheetId: string, cellId: string, value: any, t: number, author: string): Promise<void> {
@@ -225,8 +225,8 @@ export class D1Storage implements CellStorage {
       .all();
     return (res.results || []).map((row: any) => {
       let oldValue: any, newValue: any;
-      try { oldValue = JSON.parse(row.old_value); } catch (e) { oldValue = row.old_value; }
-      try { newValue = JSON.parse(row.new_value); } catch (e) { newValue = row.new_value; }
+      try { oldValue = JSON.parse(row.old_value); } catch { oldValue = row.old_value; }
+      try { newValue = JSON.parse(row.new_value); } catch { newValue = row.new_value; }
       return {
         cellId,
         oldValue,
@@ -408,6 +408,29 @@ export function parseSheet(yaml: string): Sheet {
         current.value = v;
         current.config.value = v;
         i++;
+        continue;
+      }
+
+      const rm = line.match(/^\s+routes:\s*$/);
+      if (rm) {
+        const indent = line.match(/^(\s+)/)![1].length;
+        const routes: Array<{ when: string; expr: string }> = [];
+        i++;
+        while (i < lines.length) {
+          const l = lines[i];
+          if (!l.trim()) { i++; continue; }
+          const lm = l.match(/^(\s*)-\s*when:\s*(.+?)\s*$/);
+          if (!lm || lm[1].length <= indent) break;
+          const when = lm[2].replace(/^["']|["']$/g, '');
+          i++;
+          let expr = '';
+          if (i < lines.length) {
+            const em2 = lines[i].match(/^\s+expr:\s*(.+?)\s*$/);
+            if (em2) { expr = em2[1].replace(/^["']|["']$/g, ''); i++; }
+          }
+          routes.push({ when, expr });
+        }
+        current.config.routes = routes;
         continue;
       }
 
@@ -657,7 +680,7 @@ export class QuiltEngine {
     const runtime = {
       get: (id: string) => this.values.get(id)?.value,
       set: async (id: string, v: any) => { await this.set(id, v); },
-      call: async (id: string, args?: any) => this.values.get(id)?.value,
+      call: async (id: string, _args?: any) => this.values.get(id)?.value,
       cells: new Proxy({}, { get: (_, k: string) => this.values.get(k as string)?.value }),
       log: (...args: any[]) => console.log(...args),
       fetch: (url: string, opts?: any) => fetch(url, opts),
@@ -730,7 +753,7 @@ export class QuiltEngine {
           const valueFn = new Function('with(arguments[0]) { return (' + expr + '); }');
           return valueFn(env);
         }
-      } catch (e) { /* ignore */ }
+      } catch { /* ignore */ }
     }
     return null;
   }
@@ -758,7 +781,7 @@ export class QuiltEngine {
       if (conditionMet && listener.action) {
         console.log(`[listener:${listener.cell.id}] ${listener.action}`);
       }
-    } catch (e) { /* ignore */ }
+    } catch { /* ignore */ }
   }
 
   listCells(): string[] { return [...this.cells.keys()]; }
@@ -844,7 +867,7 @@ export default {
     }
   },
 
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(_event: ScheduledEvent, _env: Env, _ctx: ExecutionContext): Promise<void> {
     // Run sensor cells on a schedule (cron trigger)
     const storage = new D1Storage(env.DB);
     const engine = new QuiltEngine({ storage });
@@ -862,7 +885,7 @@ function corsHeaders(): Record<string, string> {
   };
 }
 
-async function handleMCP(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+async function handleMCP(req: Request, _env: Env, _ctx: ExecutionContext): Promise<Response> {
   const body = await req.json() as any;
   const { method, params, id } = body;
   const storage = new D1Storage(env.DB);
@@ -898,7 +921,7 @@ async function handleMCP(req: Request, env: Env, ctx: ExecutionContext): Promise
   return Response.json({ jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } }, { headers: corsHeaders() });
 }
 
-async function handleMCPStream(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+async function handleMCPStream(req: Request, _env: Env, _ctx: ExecutionContext): Promise<Response> {
   const stream = new ReadableStream({
     start(controller) {
       const send = (event: string, data: any) => {

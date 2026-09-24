@@ -1,7 +1,7 @@
 // Test the YAML sheet parser
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { parseSheet } from '../src/worker.js';
+import { parseSheet } from '../src/worker.ts';
 
 test('parses a simple value cell', () => {
   const yaml = `id: test
@@ -54,11 +54,11 @@ cells:
   - id: explanation
     kind: ai.llm
     model: "@cf/meta/llama-3-8b-instruct"
-    prompt: "Explain: " + input`;
+    prompt: "Explain: input"`;
   const sheet = parseSheet(yaml);
   assert.equal(sheet.cells[1].kind, 'ai.llm');
   assert.equal(sheet.cells[1].config.model, '@cf/meta/llama-3-8b-instruct');
-  assert.equal(sheet.cells[1].config.prompt, 'Explain: ' + 'input');
+  assert.equal(sheet.cells[1].config.prompt, 'Explain: input');
 });
 
 test('parses a listener with watch and condition', () => {
