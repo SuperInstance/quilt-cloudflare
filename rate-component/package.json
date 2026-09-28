@@ -1,0 +1,9 @@
+{
+  "name": "rate-component-tests",
+  "private": true,
+  "type": "module",
+  "description": "Local-only test harness for rate-component/functions/api/rate.js. Not part of the drop-in — adopters only copy functions/api/rate.js.",
+  "scripts": {
+    "test": "node --test test/rate.test.mjs"
+  }
+}

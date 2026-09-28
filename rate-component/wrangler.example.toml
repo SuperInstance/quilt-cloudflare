@@ -1,0 +1,18 @@
+# Example bindings for adopting rate-component/functions/api/rate.js into
+# your own Cloudflare Pages project's wrangler.toml. Merge these blocks into
+# your existing config — do not replace your whole wrangler.toml with this.
+
+# 1. KV namespace for the visitor/global rate buckets + cost receipts.
+#    Create it once with: wrangler kv:namespace create RATE_KV
+[[kv_namespaces]]
+binding = "RATE_KV"
+id = "<your-kv-namespace-id>"
+
+# 2. The upstream key is a SECRET, never a plaintext [vars] entry:
+#    wrangler pages secret put TYPESAFEAI_KEY
+#
+# 3. (optional) tune the budget caps as plain vars — see README.md
+# [vars]
+# RATE_VISITOR_LIMIT = "30"
+# RATE_GLOBAL_DAILY_LIMIT = "4000"
+# RATE_MAX_BODY_BYTES = "4096"
