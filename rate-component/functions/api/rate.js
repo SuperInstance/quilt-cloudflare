@@ -421,7 +421,7 @@ export async function onRequestOptions() {
   return new Response(null, { status: 204, headers: { Allow: 'POST, OPTIONS' } });
 }
 
-export async function onRequest(context) {
+export async function onRequest(_context) {
   // Pages Functions dispatches onRequestPost/onRequestOptions ahead of this
   // for those methods; this only runs for anything else.
   return json({ error: 'method_not_allowed' }, 405, { Allow: 'POST, OPTIONS' });
