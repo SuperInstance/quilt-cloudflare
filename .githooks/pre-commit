@@ -1,0 +1,122 @@
+#!/bin/sh
+# fleet pre-commit — fail-closed credential key-scan (fleet-hooks, wave 53)
+#
+# This productizes the fleet's house practice (wave-52 receipts): before every
+# push, staged files were hand-scanned with `rg "ghp_|gho_|github_pat_"`.
+# Now the repository enforces it at commit time.
+#
+# Design law:
+#   - scans STAGED content (the index — exactly what would be committed),
+#     not the worktree; a staged-then-deleted file cannot slip through
+#   - deletions: nothing new to leak, excluded; binary blobs: skipped
+#     (documented blind spot, receipted in tests as C4b)
+#   - .git/* and node_modules/* paths excluded defensively
+#   - NEVER echoes the matched line (the report must not leak the secret
+#     into terminals or CI logs) — reports class + file:line only
+#   - fail-closed: any scan error blocks the commit (exit 2)
+#   - no network, stdlib-only POSIX sh (sh, git, grep, awk, mktemp, wc, tr, sed)
+#   - this hook never needs your real token — never wire secrets into it
+#
+# Escape hatch: FLEET_ALLOW=<ERE> — lines that ALSO match this regex are
+# exempt (e.g. FLEET_ALLOW='FAKE' for obviously-fake fixtures). Per-invocation,
+# visible in shell history/CI logs — deliberately loud. Use sparingly.
+#
+# Exit codes: 0 = pass (or nothing staged), 1 = credential-shaped string found,
+# 2 = hook/scan error (fail-closed).
+
+set -u
+
+PATTERNS='ghp_[A-Za-z0-9]{36}|gho_[A-Za-z0-9]{36}|ghs_[A-Za-z0-9]{36}|ghu_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|[s]k-ant-|AKIA[0-9A-Z]{16}'
+# ^ [s]k-ant- is spelled as a one-char class on purpose: the literal prefix
+#   would make this repo fail its own gate. The class matches the identical
+#   strings (standard self-scan idiom). All other pattern literals cannot
+#   self-match because the character following each prefix in this source is
+#   "[" or "|", which is outside the required character classes.
+
+fail() { printf 'fleet-pre-commit: FAIL: %s\n' "$*" >&2; exit 2; }
+
+command -v git  >/dev/null 2>&1 || fail "git not found — refusing to run"
+command -v awk  >/dev/null 2>&1 || fail "awk not found — refusing to run"
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "not inside a git work tree"
+
+tmpdir=$(mktemp -d 2>/dev/null) || fail "mktemp failed — refusing to run unscanned"
+trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+staged_list="$tmpdir/staged"
+git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR >"$staged_list" 2>/dev/null \
+  || fail "could not read the staged file list (git diff --cached failed)"
+
+# nothing staged -> nothing to scan -> pass
+[ -s "$staged_list" ] || exit 0
+
+# fail closed on pathological filenames: git C-quotes control characters
+# (e.g. newline) in non -z output even with core.quotePath=false; such a path
+# cannot be scanned reliably line-by-line and its quoted form would not match
+# the index entry, so we refuse to guess instead.
+if grep -q '^"' "$staged_list"; then
+  fail "a staged filename contains control characters (e.g. newline; git quoted it) — refusing to guess (fail-closed); rename the file and restage"
+fi
+
+findings="$tmpdir/findings"; errs="$tmpdir/errs"
+: >"$findings"; : >"$errs"
+
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  # defensive excludes (git never stages .git/ contents, but stay strict)
+  case "$f" in
+    .git/*|*/.git/*|node_modules/*|*/node_modules/*) continue ;;
+  esac
+  # fast path: one combined grep over the staged blob (index is the truth)
+  git -c core.quotePath=false --no-pager grep --cached -nI -E "$PATTERNS" -- ":(literal)$f" >/dev/null 2>>"$errs"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    # classify per pattern family so the report names the class;
+    # FLEET_ALLOW exempts lines that ALSO match it (checked in awk)
+    for spec in \
+      'GHP:ghp_[A-Za-z0-9]{36}' \
+      'GHO:gho_[A-Za-z0-9]{36}' \
+      'GHS:ghs_[A-Za-z0-9]{36}' \
+      'GHU:ghu_[A-Za-z0-9]{36}' \
+      'GH_PAT:github_pat_[A-Za-z0-9_]{22,}' \
+      'SK_ANT:[s]k-ant-' \
+      'AWS_KEY:AKIA[0-9A-Z]{16}'
+    do
+      cls=${spec%%:*}; re=${spec#*:}
+      if git -c core.quotePath=false --no-pager grep --cached -nI -E "$re" -- ":(literal)$f" 2>>"$errs" \
+           | awk -v cls="$cls" -v fp="$f" '
+               {
+                 i = index($0, ":"); rest = substr($0, i + 1)
+                 j = index(rest, ":"); ln = substr(rest, 1, j - 1)
+                 content = substr(rest, j + 1)
+                 if (ENVIRON["FLEET_ALLOW"] != "" && content ~ ENVIRON["FLEET_ALLOW"]) next
+                 printf "%s\t%s\t%s\n", cls, fp, ln
+               }' >>"$findings"
+      then :
+      else printf '%s\n' "classify error on: $f" >>"$errs"
+      fi
+    done
+  elif [ "$rc" -ne 1 ]; then
+    printf '%s\n' "scan error (git grep rc=$rc) on: $f" >>"$errs"
+  fi
+done <"$staged_list"
+
+if [ -s "$errs" ]; then
+  printf 'fleet-pre-commit: BLOCKED (fail-closed) — the scan itself errored; commit refused.\n' >&2
+  sed 's/^/  /' "$errs" >&2
+  printf '  Fix the condition above and retry. (exit 2)\n' >&2
+  exit 2
+fi
+
+if [ -s "$findings" ]; then
+  printf 'fleet-pre-commit: BLOCKED — credential-shaped string(s) in staged content.\n' >&2
+  printf '\n  class      file:line\n' >&2
+  awk -F'\t' '{ printf "  %-10s %s:%s\n", $1, $2, $3 }' "$findings" >&2
+  printf '\n  The matched text is intentionally NOT shown (do not leak it into logs).\n' >&2
+  printf '  Remove the secret or replace it with a placeholder. ONLY for obviously-fake\n' >&2
+  printf '  fixtures, retry once with: FLEET_ALLOW=<regex naming your fixture marker> git commit ...\n' >&2
+  printf '  Scan covers: ghp_/gho_/ghs_/ghu_ (36), github_pat_ (22+), sk-ant prefix, AKIA+16.\n' >&2
+  printf '  Design + tests: https://github.com/SuperInstance/fleet-hooks (exit 1)\n' >&2
+  exit 1
+fi
+
+exit 0
