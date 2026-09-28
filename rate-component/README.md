@@ -2,8 +2,9 @@
 
 A self-contained Cloudflare Pages Function (`/api/rate`) that gives any
 static, offline-first web app a **live verdict on the visitor's own work**
-("rate my chart", "grade my route", "score my draft") — with a hard
-per-visitor budget cap, a global daily backstop, and a **mandatory graceful
+("rate my chart", "grade my route", "score my draft") — with a per-visitor
+budget cap (a soft *guard*, not an atomic hard stop — see **Limitations &
+threat model**), a global daily backstop, and a **mandatory graceful
 degrade**: if the budget is spent, the key isn't deployed, or the upstream
 judge errors, the endpoint still returns HTTP 200 and the calling app keeps
 working. The live call is always an enhancement, never load-bearing.
@@ -105,6 +106,36 @@ Graceful degrade (**always 200**):
 Hard rejections (never disguised as a degrade — these mean the caller did
 something wrong, not that the budget ran out): `403` cross-origin, `413`
 oversized body, `400` malformed/missing `content`, `405` non-POST/OPTIONS.
+
+## Limitations & threat model
+
+*Audited by playing the quilt situation **S17 "The Weakest Leaf"** against this
+component (see `SuperInstance/AI-Writings` `situations/play/weakest-leaf.mjs`,
+ledger d098). The decomposing JEV fold located the budget cap as the weakest
+guarantee; a Moth quantum-drawn adversary (Bell S=2.801) confirmed the bypasses
+below. Stated honestly here rather than overclaimed.*
+
+- **The cap is a soft budget *guard*, not an atomic hard stop.** Workers KV is
+  eventually consistent: the bucket is read → checked → written, so a burst of
+  simultaneous requests can each read the same pre-decrement value and all pass
+  before any write lands. Real spend can therefore *slightly* overshoot the cap
+  under concurrency. This is acceptable for a **few-cents aha budget** (the blast
+  radius is tiny and JEV is cheap); it is **not** a billing hard-stop.
+  - *Mitigation shipped:* the spend is **reserved before** the upstream call
+    (`spendBudget` runs ahead of the `fetch`), so the check can't be raced by a
+    single client and a timing-out/erroring call still counts — no free retries.
+    This narrows, but does not close, the concurrent-burst window (KV is still
+    eventually consistent). A failed call is **not** refunded, by design.
+  - *For a true hard cap:* back the counter with a **Durable Object** (or D1 with
+    a transaction) so the decrement is atomic. Drop-in DO variant is a follow-up.
+- **Same-origin is a friction gate, not authentication.** It checks `Origin` /
+  `Sec-Fetch-Site`, which a non-browser client can forge. It stops casual
+  cross-site embedding and honest browsers; it does not stop a determined script.
+  The real backstops against abuse are the per-visitor + global budget caps.
+- **Distributed abuse.** A botnet of many residential IPs can each stay under the
+  per-visitor cap while collectively approaching the global daily ceiling faster
+  than the (eventually consistent) global counter converges. The global cap bounds
+  worst-case daily spend to a *fixed, small* number regardless — that is the point.
 
 ## KV schema
 
