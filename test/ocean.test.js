@@ -108,7 +108,10 @@ test('miss → 🧠 wave: real answer, upsert taught, row booked', async () => {
   if ('refused' in res) return;
   assert.equal(res.source, 'wave');
   assert.equal(res.sim, 0.5); // honest: neighbor existed but below threshold
-  assert.equal(taught, res.answer);
+  // 40008 fix: the id is the chart-recipe hash of the answer (≤64 bytes),
+  // never the answer text itself (348 bytes crashed the first real wave).
+  assert.equal(taught, fnv1a64(res.answer));
+  assert.ok(taught.length <= 64, `id must be ≤64 bytes, got ${taught.length}`);
   const log = await readLog(kvMap);
   assert.equal(log.length, 1);
   assert.equal(log[0].source, 'wave');
@@ -116,7 +119,7 @@ test('miss → 🧠 wave: real answer, upsert taught, row booked', async () => {
 });
 
 test('hit ≥ threshold → ⚡ ocean: no model call, remembered answer', async () => {
-  const { deps, kvMap } = fakeDeps({ neighbor: { id: 'remembered answer', score: OCEAN_HIT_THRESHOLD } });
+  const { deps, kvMap } = fakeDeps({ neighbor: { id: fnv1a64('remembered answer'), score: OCEAN_HIT_THRESHOLD, metadata: { q: 'what is a cell?', answer: 'remembered answer' } } });
   let completed = false;
   deps.ai.complete = async () => { completed = true; return 'should not run'; };
   const res = await oceanAsk(deps, 'what is a cell?');
@@ -131,9 +134,9 @@ test('hit ≥ threshold → ⚡ ocean: no model call, remembered answer', async 
 });
 
 test('threshold boundary: 0.9199 misses, 0.92 hits', async () => {
-  const below = await oceanAsk(fakeDeps({ neighbor: { id: 'x', score: 0.9199 } }).deps, 'q');
+  const below = await oceanAsk(fakeDeps({ neighbor: { id: 'x', score: 0.9199, metadata: { answer: 'x' } } }).deps, 'q');
   assert.ok(!('refused' in below) && below.source === 'wave');
-  const above = await oceanAsk(fakeDeps({ neighbor: { id: 'x', score: 0.92 } }).deps, 'q');
+  const above = await oceanAsk(fakeDeps({ neighbor: { id: 'x', score: 0.92, metadata: { answer: 'x' } } }).deps, 'q');
   assert.ok(!('refused' in above) && above.source === 'ocean');
 });
 
@@ -232,7 +235,7 @@ test('pin 13: ocean hit during tide-out still answers 200-equivalent from memory
   const before = (await td.readWindow()).remaining_micro_usd;
   const completed = td.completions();
 
-  td.setNeighbor({ id: 'the remembered tide', score: 0.99 });
+  td.setNeighbor({ id: fnv1a64('the remembered tide'), score: 0.99, metadata: { q: 'what is a cell?', answer: 'the remembered tide' } });
   const hit = await oceanAsk(td.deps, 'what is a cell?');
   assert.ok(!('refused' in hit), 'hit is never budget-blocked');
   assert.equal(hit.source, 'ocean');
@@ -302,4 +305,101 @@ test('pin 16: tideStats exposes the budget fields and never throws', async () =>
   const corrupted = await tideStats(kv, 1_700_000_000_000);
   assert.equal(corrupted.hourly_cap_usd, 0.02);
   assert.equal(corrupted.budget_remaining_usd, 0);
+});
+
+// --- pins 2026-09-30: hash-id waves (40008 fix), bottles, the µ$ ledger -----
+
+import {
+  drainBottles, BOTTLES_KEY, OCEAN_LOG_KEY, FRESH_COST_ESTIMATE_MICRO,
+} from '../src/ocean.ts';
+
+function freshDeps(opts = {}) {
+  const kvMap = new Map();
+  const state = { t: 1_700_000_000_000, insertedId: '', insertedMeta: null, completions: [] };
+  const deps = {
+    ai: {
+      async embed() { return [1, 0, 0]; },
+      async complete(q) { state.completions.push(q); return opts.answer ?? 'a fresh answer'; },
+    },
+    vector: {
+      async query() {
+        return state.insertedId
+          ? [{ id: state.insertedId, score: 0.99, metadata: state.insertedMeta }]
+          : [];
+      },
+      async insert(id, _vec, meta) { state.insertedId = id; state.insertedMeta = meta; },
+    },
+    kv: {
+      async get(k) { return kvMap.get(k) ?? null; },
+      async put(k, v) { kvMap.set(k, v); },
+    },
+    now: () => state.t,
+    rand: () => 0.5,
+  };
+  return { deps, kvMap, state };
+}
+
+test('wave stores a ≤64-byte hash id; next ask serves it from metadata (40008 fix)', async () => {
+  const { deps, state } = freshDeps();
+  const wave = await oceanAsk(deps, 'teach me the tide');
+  assert.equal(wave.source, 'wave');
+  assert.ok(state.insertedId.length <= 64, `id must be ≤64 bytes, got ${state.insertedId.length}`);
+  assert.equal(state.insertedMeta.answer, 'a fresh answer');
+  const hit = await oceanAsk(deps, 'teach me the tide');
+  assert.equal(hit.source, 'ocean');
+  assert.equal(hit.answer, 'a fresh answer');
+});
+
+test('tide-out bottles the question; drain answers it into the ocean', async () => {
+  const { deps, kvMap, state } = freshDeps();
+  kvMap.set(TIDE_KV_KEY, JSON.stringify({
+    remaining_micro_usd: 1, reset_at_ms: state.t + 600_000, window_minutes: 10,
+  }));
+  const refused = await oceanAsk(deps, 'asked at low tide');
+  assert.equal(refused.refused, true);
+  assert.ok(refused.bottled, 'tide-out refusal must bottle the question');
+  assert.ok(refused.bottled.queue_position >= 1);
+  const waiting = JSON.parse(kvMap.get(BOTTLES_KEY));
+  assert.equal(waiting.length, 1);
+  assert.equal(waiting[0].q, 'asked at low tide');
+
+  state.t += 3_600_000; // the tide returns
+  const drain = await drainBottles(deps);
+  assert.equal(drain.drained, 1);
+  assert.equal(drain.row.source, 'bottle');
+  assert.deepEqual(JSON.parse(kvMap.get(BOTTLES_KEY)), []);
+  const log = JSON.parse(kvMap.get(OCEAN_LOG_KEY));
+  assert.equal(log[log.length - 1].source, 'bottle');
+});
+
+test('drain no-ops on empty queue and while the tide is out', async () => {
+  const { deps, kvMap, state } = freshDeps();
+  const none = await drainBottles(deps);
+  assert.equal(none.drained, 0);
+  kvMap.set(BOTTLES_KEY, JSON.stringify([{ q_hash: 'h', q: 'queued', ts: 1 }]));
+  kvMap.set(TIDE_KV_KEY, JSON.stringify({
+    remaining_micro_usd: 1, reset_at_ms: state.t + 600_000, window_minutes: 10,
+  }));
+  const out = await drainBottles(deps);
+  assert.equal(out.drained, 0);
+  assert.equal(out.reason, 'tide_out');
+  assert.equal(JSON.parse(kvMap.get(BOTTLES_KEY)).length, 1, 'bottle must survive a tide-out drain');
+});
+
+test('the ledger: hits save, waves spend, net tracks the profit line', async () => {
+  const mk = (i, source) => ({
+    seq: i, prev_hash: 'x', question_hash: 'q', answer_hash: 'a', sim: 0.95,
+    source, model: 'm', ms: 5, ts: i, row_hash: 'r' + i,
+  });
+  const kvMap = new Map();
+  kvMap.set(OCEAN_LOG_KEY, JSON.stringify([mk(0, 'ocean'), mk(1, 'ocean'), mk(2, 'wave')]));
+  const s = await oceanStats({
+    async get(k) { return kvMap.get(k) ?? null; },
+    async put(k, v) { kvMap.set(k, v); },
+  });
+  assert.equal(s.saved_micro_usd, 2 * FRESH_COST_ESTIMATE_MICRO);
+  assert.equal(s.spent_micro_usd, FRESH_COST_ESTIMATE_MICRO);
+  assert.equal(s.net_micro_usd, FRESH_COST_ESTIMATE_MICRO);
+  assert.equal(s.bottles_drained, 0);
+  assert.equal(s.bottles_waiting, 0);
 });

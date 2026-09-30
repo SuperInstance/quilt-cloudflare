@@ -796,7 +796,7 @@ export class QuiltEngine {
 // ============================================================================
 
 import {
-  oceanAsk, oceanStats, oceanRecent, checkRate, tideStats,
+  oceanAsk, oceanStats, oceanRecent, checkRate, tideStats, drainBottles,
   OCEAN_MODEL, type OceanAI, type OceanVector,
 } from './ocean.ts';
 
@@ -865,7 +865,7 @@ export default {
       }
 
       if (url.pathname.startsWith('/api/ocean/')) {
-        return handleOcean(req, env, url);
+        return handleOcean(req, env, url, ctx);
       }
 
       if (url.pathname === '/mcp/sse') {
@@ -924,9 +924,10 @@ function oceanAI(ai: Ai): OceanAI {
 function oceanVector(index: VectorizeIndex): OceanVector {
   return {
     async query(vec: number[], topK: number) {
-      const res = await index.query(vec, { topK, returnMetadata: 'none' });
-      // Vectorize id is the answer text; score is cosine similarity
-      return res.matches.map((m: any) => ({ id: m.id, score: m.score }));
+      const res = await index.query(vec, { topK, returnMetadata: 'all' });
+      // Vectorize id is fnv1a64(answer) (64-byte id cap); the answer text
+      // rides home in the vector's metadata.
+      return res.matches.map((m: any) => ({ id: m.id, score: m.score, metadata: m.metadata }));
     },
     async insert(id: string, vec: number[], metadata: Record<string, unknown>) {
       await index.insert([{ id, values: vec, metadata }]);
@@ -941,7 +942,7 @@ function oceanKV(kv: KVNamespace) {
   };
 }
 
-async function handleOcean(req: Request, env: Env, url: URL): Promise<Response> {
+async function handleOcean(req: Request, env: Env, url: URL, ctx?: ExecutionContext): Promise<Response> {
   const kv = env.CACHE ? oceanKV(env.CACHE) : undefined;
 
   // Health: what bindings does this ocean actually have? Honest, not hopeful.
@@ -978,12 +979,46 @@ async function handleOcean(req: Request, env: Env, url: URL): Promise<Response> 
       // witness-native fields
       refusals: s.refusals,
       tip: s.tip,
+      // the ledger (rough µ$ estimate): net < 0 means the ocean is profitable
+      saved_micro_usd: s.saved_micro_usd,
+      spent_micro_usd: s.spent_micro_usd,
+      net_micro_usd: s.net_micro_usd,
+      bottles_waiting: s.bottles_waiting,
+      bottles_drained: s.bottles_drained,
     }, { headers: corsHeaders() });
   }
 
   if (url.pathname === '/api/ocean/recent' && req.method === 'GET') {
     const n = Math.min(Number(url.searchParams.get('n') ?? '20') || 20, 100);
     return Response.json(await oceanRecent(kv!, n), { headers: corsHeaders() });
+  }
+
+  if (url.pathname === '/api/ocean/bottles' && req.method === 'GET') {
+    const s = await oceanStats(kv!);
+    return Response.json({
+      waiting: s.bottles_waiting,
+      drained_total: s.bottles_drained,
+    }, { headers: corsHeaders() });
+  }
+
+  // /near — look INTO the ocean's memory without asking it: embed q, query
+  // the index raw, and return what the fabric actually holds. Ops surface
+  // for the witness: what would a hit even look like right now?
+  if (url.pathname === '/api/ocean/near' && req.method === 'GET') {
+    const q = url.searchParams.get('q') ?? '';
+    const k = Math.min(Number(url.searchParams.get('k') ?? '3') || 3, 20);
+    if (!q.trim()) return Response.json({ error: 'need ?q=' }, { status: 400, headers: corsHeaders() });
+    const vec = await oceanAI(env.AI).embed(q);
+    const index = env.VECTORIZE!;
+    const described = await (index as any).describe().catch((e: Error) => ({ error: String(e) }));
+    const res = await index.query(vec, { topK: k, returnMetadata: 'all' }).catch((e: Error) => ({ error: String(e), matches: [] }));
+    return Response.json({
+      q,
+      dims: vec.length,
+      index_describe: described,
+      raw_matches: (res as any).matches ?? [],
+      error: (res as any).error,
+    }, { headers: corsHeaders() });
   }
 
   if (url.pathname === '/api/ocean/ask' && req.method === 'POST') {
@@ -1005,6 +1040,8 @@ async function handleOcean(req: Request, env: Env, url: URL): Promise<Response> 
           retry_after_seconds: result.tide.retry_after_seconds,
           budget_window_usd: result.tide.budget_window_usd,
           hourly_cap_usd: result.tide.hourly_cap_usd,
+          // the question was bottled — it answers into the ocean when the tide returns
+          ...(result.bottled ? { bottled: result.bottled } : {}),
         }, { status: 429, headers: corsHeaders() });
       }
       const status = result.reason === 'empty question' || result.reason === 'question too long' ? 400 : 429;
@@ -1015,6 +1052,10 @@ async function handleOcean(req: Request, env: Env, url: URL): Promise<Response> 
         retry_after_seconds: status === 429 ? 60 : undefined,
       }, { status, headers: corsHeaders() });
     }
+    // Pay the ferryman: one drained bottle per successful ask, only while
+    // the tide is in (drainBottles no-ops otherwise). Deferred questions
+    // become ocean waves for everyone, at a rate the traffic itself sets.
+    ctx?.waitUntil(drainBottles({ ai: oceanAI(env.AI), vector: oceanVector(env.VECTORIZE), kv: kv! }).catch(() => {}));
     return Response.json({
       // landing-page contract
       answer: result.answer,

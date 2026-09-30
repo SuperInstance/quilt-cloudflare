@@ -105,8 +105,8 @@ export interface OceanAI {
 }
 
 export interface OceanVector {
-  // returns [{ id, score }] best-first
-  query(vec: number[], topK: number): Promise<Array<{ id: string; score: number }>>;
+  // returns [{ id, score, metadata? }] best-first
+  query(vec: number[], topK: number): Promise<Array<{ id: string; score: number; metadata?: Record<string, unknown> }>>;
   insert(id: string, vec: number[], metadata: Record<string, unknown>): Promise<void>;
 }
 
@@ -143,7 +143,7 @@ export interface TideOutInfo {
 
 export type OceanResult =
   | OceanAnswer
-  | { refused: true; reason: string; row: OceanRow; tide?: TideOutInfo };
+  | { refused: true; reason: string; row: OceanRow; tide?: TideOutInfo; bottled?: BottleInfo };
 
 export async function loadLog(kv: OceanKV): Promise<OceanRow[]> {
   const raw = await kv.get(OCEAN_LOG_KEY);
@@ -161,7 +161,7 @@ export async function oceanAsk(
   const log = await loadLog(deps.kv);
   const prev = log.length ? log[log.length - 1] : null;
 
-  const refuse = async (reason: string, tide?: TideOutInfo) => {
+  const refuse = async (reason: string, tide?: TideOutInfo, bottled?: BottleInfo) => {
     const row = makeRow(prev, {
       question_hash: fnv1a64(question),
       answer_hash: fnv1a64(''),
@@ -172,7 +172,13 @@ export async function oceanAsk(
       ts: now(),
     });
     await appendLog(deps.kv, [...log, row]);
-    return { refused: true as const, reason, row, ...(tide ? { tide } : {}) };
+    return {
+      refused: true as const,
+      reason,
+      row,
+      ...(tide ? { tide } : {}),
+      ...(bottled ? { bottled } : {}),
+    };
   };
 
   if (rate && !rate.allowed) return refuse(rate.reason ?? 'rate limited');
@@ -185,12 +191,15 @@ export async function oceanAsk(
   const neighbors = await deps.vector.query(vec, 1);
   const best = neighbors[0];
 
-  if (best && best.score >= OCEAN_HIT_THRESHOLD) {
+  const remembered = best && best.score >= OCEAN_HIT_THRESHOLD
+    && typeof best.metadata?.answer === 'string' && (best.metadata.answer as string).length > 0;
+  if (remembered) {
     // ⚡ ocean: serve the remembered answer. Hits bypass the budget by
     // design — Vectorize dims cost ~$0.000008 and the first 30M/mo are free.
     // When the tide is out we still answer 200, flagged, instead of queuing
     // behind fresh inference: the ocean gets cheaper under load.
-    const answer = best.id; // vector id IS the answer text (see worker glue)
+    // The vector id is fnv1a64(answer); the answer text rides in metadata.
+    const answer = (best!.metadata as Record<string, unknown>).answer as string;
     const tideOut = await tideIsOut(deps.kv, q, now());
     const row = makeRow(prev, {
       question_hash: fnv1a64(q),
@@ -216,15 +225,24 @@ export async function oceanAsk(
   // by tideGate, so a new tide always answers the first sailor.
   const gate = await tideGate(deps.kv, q, now(), rand);
   if (!gate.allowed) {
+    // Low tide: don't just refuse — bottle the question. It waits in the
+    // queue and gets answered INTO the ocean when the tide returns, so a
+    // 429 becomes a deferred contribution to the commons instead of a
+    // dead request. The oldest accepted problem — "rate-limited means
+    // lost" — ends here.
+    const bottled = await bottleQuestion(deps.kv, q, now());
     return refuse('the tide is out — fresh inference budget exhausted', {
       retry_after_seconds: gate.retryAfterSeconds,
       budget_window_usd: tideWindowBudgetMicro(gate.window.window_minutes) / 1_000_000,
       hourly_cap_usd: HOURLY_CAP_USD,
-    });
+    }, bottled);
   }
   await tideSpend(deps.kv, gate);
   const answer = await deps.ai.complete(q);
-  await deps.vector.insert(answer, vec, { q, answer });
+  // Vectorize caps ids at 64 bytes; the answer text cannot be the id (the
+  // first wave ever crashed on this: VECTOR_INSERT_ERROR 40008, 348 bytes).
+  // The id is the chart-recipe hash; the text rides home in metadata.
+  await deps.vector.insert(fnv1a64(answer), vec, { q, answer });
   const row = makeRow(prev, {
     question_hash: fnv1a64(q),
     answer_hash: fnv1a64(answer),
@@ -236,6 +254,63 @@ export async function oceanAsk(
   });
   await appendLog(deps.kv, [...log, row]);
   return { answer, source: 'wave', sim: best ? best.score : null, row };
+}
+
+// --- bottles: questions caught at low tide, answered when it returns --------
+
+export const BOTTLES_KEY = 'ocean:bottles';
+export const BOTTLES_CAP = 50;
+// tide.ts math: a 4-word ask prices at 18 µ$ — the ledger's rough per-row unit.
+export const FRESH_COST_ESTIMATE_MICRO = 18;
+
+export interface Bottle { q_hash: string; q: string; ts: number }
+export interface BottleInfo { id: string; queue_position: number }
+export interface DrainResult { drained: 0 | 1; reason?: string; row?: OceanRow }
+
+export async function bottleQuestion(kv: OceanKV, q: string, nowMs: number): Promise<BottleInfo> {
+  const raw = await kv.get(BOTTLES_KEY);
+  const bottles: Bottle[] = raw ? JSON.parse(raw) : [];
+  const bottle: Bottle = { q_hash: fnv1a64(q), q, ts: nowMs };
+  const next = [...bottles, bottle].slice(-BOTTLES_CAP);
+  await kv.put(BOTTLES_KEY, JSON.stringify(next));
+  return { id: bottle.q_hash, queue_position: next.length };
+}
+
+// Answer ONE bottled question per drain, only while the tide is in, and
+// teach it to the ocean — the deferred ask becomes a permanent wave that
+// serves every future sailor for free.
+export async function drainBottles(deps: OceanDeps): Promise<DrainResult> {
+  const now = deps.now ?? Date.now;
+  const rand = deps.rand ?? Math.random;
+  const log = await loadLog(deps.kv);
+  const prev = log.length ? log[log.length - 1] : null;
+  const raw = await deps.kv.get(BOTTLES_KEY);
+  const bottles: Bottle[] = raw ? JSON.parse(raw) : [];
+  if (!bottles.length) return { drained: 0, reason: 'no bottles' };
+
+  const oldest = bottles[0];
+  const gate = await tideGate(deps.kv, oldest.q, now(), rand);
+  if (!gate.allowed) return { drained: 0, reason: 'tide_out' };
+  await tideSpend(deps.kv, gate);
+
+  const t0 = now();
+  const vec = await deps.ai.embed(oldest.q);
+  const answer = await deps.ai.complete(oldest.q);
+  await deps.vector.insert(fnv1a64(answer), vec, { q: oldest.q, answer });
+  const neighbors = await deps.vector.query(vec, 1);
+  const sim = neighbors[0]?.score ?? null;
+  const row = makeRow(prev, {
+    question_hash: fnv1a64(oldest.q),
+    answer_hash: fnv1a64(answer),
+    sim,
+    source: 'bottle',
+    model: OCEAN_MODEL,
+    ms: now() - t0,
+    ts: now(),
+  });
+  await appendLog(deps.kv, [...log, row]);
+  await deps.kv.put(BOTTLES_KEY, JSON.stringify(bottles.slice(1)));
+  return { drained: 1, row };
 }
 
 async function appendLog(kv: OceanKV, rows: OceanRow[]): Promise<void> {
@@ -277,19 +352,36 @@ export async function oceanStats(kv: OceanKV): Promise<{
   ocean_hits: number;
   waves: number;
   refusals: number;
+  bottles_drained: number;
   hit_rate: number;
   tip: string | null;
+  saved_micro_usd: number;
+  spent_micro_usd: number;
+  net_micro_usd: number;
+  bottles_waiting: number;
 }> {
   const log = await loadLog(kv);
   const hits = log.filter(r => r.source === 'ocean').length;
   const waves = log.filter(r => r.source === 'wave').length;
+  const drained = log.filter(r => r.source === 'bottle').length;
+  const raw = await kv.get(BOTTLES_KEY);
+  const waiting = raw ? (JSON.parse(raw) as Bottle[]).length : 0;
+  // The ledger: every ⚡ hit avoided a fresh inference; every 🧠 wave (and
+  // drained bottle) paid one. Rough per-row estimate, clearly labeled.
+  const saved = hits * FRESH_COST_ESTIMATE_MICRO;
+  const spent = (waves + drained) * FRESH_COST_ESTIMATE_MICRO;
   return {
     calls: log.length,
     ocean_hits: hits,
     waves,
     refusals: log.filter(r => r.source === 'refused').length,
+    bottles_drained: drained,
     hit_rate: log.length ? hits / log.length : 0,
     tip: log.length ? log[log.length - 1].row_hash : null,
+    saved_micro_usd: saved,
+    spent_micro_usd: spent,
+    net_micro_usd: saved - spent,
+    bottles_waiting: waiting,
   };
 }
 
