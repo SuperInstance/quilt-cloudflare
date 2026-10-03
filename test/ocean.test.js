@@ -66,7 +66,7 @@ async function readLog(kvMap) {
 
 // --- pins --------------------------------------------------------------------
 
-test('fnv1a64 matches the pinned café vector', () => {
+test('fnv1a64 matches the pinned café vector (UTF-16 code units)', () => {
   // cross-checked against the executor pin recipe: hex16 lowercase, no 0x
   assert.equal(fnv1a64('').length, 16);
   assert.match(fnv1a64('hello'), /^[0-9a-f]{16}$/);
@@ -74,6 +74,13 @@ test('fnv1a64 matches the pinned café vector', () => {
   assert.notEqual(fnv1a64('hello'), fnv1a64('hellp'));
   // deterministic known value (fnv-1a-64 of "ocean")
   assert.equal(fnv1a64('ocean'), '2ee6bf0171b865d1');
+  // TRUE café pin (Round 20 standing doc): charCodeAt iterates UTF-16 code
+  // units, so this is the actual fleet receipt-seal behavior — NOT UTF-8.
+  // UTF-16 seal:   fnv1a64('café Δ 日本語') -> 77ff2029b867f2b5
+  // UTF-8 same fnv                        -> 24a555471370b18d (diverges)
+  // Seals hashed under UTF-8 elsewhere in the fleet will NOT verify here.
+  assert.equal(fnv1a64('café Δ 日本語'), '77ff2029b867f2b5');
+  assert.notEqual(fnv1a64('café Δ 日本語'), '24a555471370b18d');
 });
 
 test('canon sorts keys and compacts', () => {
